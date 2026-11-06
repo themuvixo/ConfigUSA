@@ -1,0 +1,449 @@
+name: Config Hub 24/7 (Xray + Hysteria2)
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: xray-server-cluster
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+  actions: write
+
+env:
+  MTPROTO_FAKE_TLS_DOMAIN: www.google.com
+  # Optional Hysteria2: public host:port of a playit.gg UDP tunnel (repo Variable HY2_ENDPOINT)
+  HY2_ENDPOINT: ${{ vars.HY2_ENDPOINT }}
+
+jobs:
+  run-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y nginx curl unzip jq openssl ca-certificates
+          sudo systemctl stop nginx 2>/dev/null || true
+
+      - name: Download Binaries (Xray, cloudflared, Hysteria2, mtg, bore)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p $HOME/xray $HOME/cf $HOME/mtg $HOME/bore $HOME/hy2
+
+          curl -fsSL -o $HOME/xray/xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -o $HOME/xray/xray.zip -d $HOME/xray > /dev/null
+          chmod +x $HOME/xray/xray
+          $HOME/xray/xray version | head -n 1
+
+          curl -fsSL -o $HOME/cf/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x $HOME/cf/cloudflared
+          $HOME/cf/cloudflared --version
+
+          # Hysteria2 server (optional: only started when a UDP tunnel is configured)
+          if curl -fsSL -o $HOME/hy2/hysteria \
+            https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64; then
+            chmod +x $HOME/hy2/hysteria
+            echo "✅ hysteria: $($HOME/hy2/hysteria version 2>&1 | head -n 3 | tr '\n' ' ')"
+          else
+            echo "⚠️ hysteria download failed; Hysteria2 disabled this session."
+          fi
+
+          # Optional MTProto stack: failure here never stops the main server
+          asset_url() {
+            curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/$1/releases/latest" \
+              | jq -r --arg re "$2" '.assets[].browser_download_url | select(test($re))' | head -n 1
+          }
+          install_tar() {
+            local url="$1" dir="$2" bin="$3"
+            [ -n "$url" ] || return 1
+            curl -fsSL -o "/tmp/${bin}.tgz" "$url" || return 1
+            tar -xzf "/tmp/${bin}.tgz" -C "$dir" || return 1
+            local found
+            found=$(find "$dir" -type f -name "$bin" | head -n 1)
+            [ -n "$found" ] || return 1
+            mv -f "$found" "$dir/$bin" 2>/dev/null || true
+            chmod +x "$dir/$bin"
+          }
+
+          if install_tar "$(asset_url 9seconds/mtg 'linux-amd64\.tar\.gz$')" $HOME/mtg mtg; then
+            echo "✅ mtg installed: $($HOME/mtg/mtg --version 2>&1 | head -n 1)"
+          else
+            echo "⚠️ mtg download failed; MTProto will be disabled this session."
+          fi
+          if install_tar "$(asset_url ekzhang/bore 'x86_64-unknown-linux-musl\.tar\.gz$')" $HOME/bore bore; then
+            echo "✅ bore installed: $($HOME/bore/bore --version 2>&1 | head -n 1)"
+          else
+            echo "⚠️ bore download failed; MTProto will be disabled this session."
+          fi
+
+      - name: Launch Cluster, Deploy & 24/7 Keepalive
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+          PLAYIT_SECRET: ${{ secrets.PLAYIT_SECRET }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          NO_COLOR: '1'
+        run: |
+          [ -n "$PAT_TOKEN" ] && echo "::add-mask::$PAT_TOKEN"
+          TOKEN="${PAT_TOKEN:-$FALLBACK_TOKEN}"
+          BRANCH="${REF_NAME:-main}"
+          OWNER="${REPO%%/*}"
+          REPO_NAME="${REPO#*/}"
+          GH_PAGES_URL="https://${OWNER}.github.io/${REPO_NAME}/"
+          MTP_HOST=""
+          MTP_PORT=""
+          HY2_PIN=""
+          HY2_ON=""
+          DISABLED=""
+          RL_HOST=""
+          RL_PORT=""
+
+          [ -n "$PLAYIT_SECRET" ] && echo "::add-mask::$PLAYIT_SECRET"
+          mkdir -p dist /tmp/xray_server
+
+          # ---------- helpers ----------
+          start_mtproto() {
+            MTP_HOST=""; MTP_PORT=""
+            if [ ! -x $HOME/mtg/mtg ] || [ ! -x $HOME/bore/bore ]; then
+              echo "ℹ️ MTProto binaries missing; skipping Telegram proxy."
+              return 0
+            fi
+            local secret
+            secret=$(cat /tmp/xray_server/mtproto_secret.txt)
+
+            pkill -f "$HOME/mtg/mtg" 2>/dev/null || true
+            nohup $HOME/mtg/mtg simple-run --prefer-ip=prefer-ipv4 127.0.0.1:8443 "$secret" > /tmp/mtg.log 2>&1 &
+            sleep 2
+            if ! pgrep -f "$HOME/mtg/mtg" > /dev/null; then
+              nohup $HOME/mtg/mtg simple-run 127.0.0.1:8443 "$secret" > /tmp/mtg.log 2>&1 &
+              sleep 2
+            fi
+            if ! pgrep -f "$HOME/mtg/mtg" > /dev/null; then
+              echo "⚠️ mtg failed to start:"; tail -n 20 /tmp/mtg.log || true
+              return 0
+            fi
+
+            pkill -f "bore local 8443" 2>/dev/null || true
+            nohup $HOME/bore/bore local 8443 --to bore.pub > /tmp/bore.log 2>&1 &
+            for i in $(seq 1 30); do
+              MTP_PORT=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/bore.log | grep -oE 'bore\.pub:[0-9]+' | head -n 1 | cut -d: -f2 || true)
+              [ -n "$MTP_PORT" ] && break
+              sleep 1
+            done
+            if [ -z "$MTP_PORT" ]; then
+              echo "⚠️ bore.pub TCP tunnel unavailable; MTProto disabled this cycle."
+              tail -n 20 /tmp/bore.log || true
+              pkill -f "bore local 8443" 2>/dev/null || true
+              return 0
+            fi
+            MTP_HOST="bore.pub"
+            echo "✅ MTProto proxy live at ${MTP_HOST}:${MTP_PORT}"
+          }
+
+          # Experimental: VLESS + REALITY on 127.0.0.1:10010 exposed through a second bore.pub tunnel
+          start_reality() {
+            RL_HOST=""; RL_PORT=""
+            if [ ! -x $HOME/bore/bore ] || ! grep -q "vless-reality-in" /tmp/xray_server/xray_config.json; then
+              echo "ℹ️ REALITY skipped (bore or REALITY keys unavailable)."
+              return 0
+            fi
+            pkill -f "bore local 10010" 2>/dev/null || true
+            nohup $HOME/bore/bore local 10010 --to bore.pub > /tmp/bore_reality.log 2>&1 &
+            for i in $(seq 1 30); do
+              RL_PORT=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/bore_reality.log | grep -oE 'bore\.pub:[0-9]+' | head -n 1 | cut -d: -f2 || true)
+              [ -n "$RL_PORT" ] && break
+              sleep 1
+            done
+            if [ -z "$RL_PORT" ]; then
+              echo "⚠️ REALITY tunnel unavailable this cycle."
+              pkill -f "bore local 10010" 2>/dev/null || true
+              return 0
+            fi
+            RL_HOST="bore.pub"
+            echo "✅ VLESS REALITY live at ${RL_HOST}:${RL_PORT}"
+          }
+
+          # Ask playit.gg which public host:port the UDP tunnel got (so HY2_ENDPOINT becomes optional).
+          discover_playit_endpoint() {
+            local out ep
+            out=$(curl -fsS --max-time 12 -X POST "https://api.playit.gg/agents/rundata" \
+              -H "Authorization: agent-key ${PLAYIT_SECRET}" -H "Content-Type: application/json" -d '{}' 2>/dev/null) || return 1
+            ep=$(echo "$out" | jq -r '[.data.tunnels[]? | select(((.local_port // .origin.config.local_port // 0) | tonumber? // 0) == 8444)][0]
+              | if . == null then empty else ((.assigned_domain // .domain // .display_address // "") + ":" + ((.port.from // .from_port // .port // "") | tostring)) end' 2>/dev/null || true)
+            case "$ep" in *:?*) echo "$ep"; return 0 ;; esac
+            echo "ℹ️ playit rundata had no tunnel for local port 8444: $(echo "$out" | head -c 300)" >&2
+            return 1
+          }
+
+          start_playit() {
+            docker rm -f playit > /dev/null 2>&1 || true
+            if docker run -d --name playit --restart unless-stopped --network host -e SECRET_KEY="$PLAYIT_SECRET" \
+                 ghcr.io/playit-cloud/playit-agent:latest > /tmp/playit_docker.txt 2>&1; then
+              return 0
+            fi
+            echo "⚠️ docker playit failed ($(head -c 200 /tmp/playit_docker.txt)); trying the native agent..."
+            if [ ! -x $HOME/playit ]; then
+              curl -fsSL -o $HOME/playit https://github.com/playit-cloud/playit-agent/releases/latest/download/playit-linux-amd64 || return 1
+              chmod +x $HOME/playit
+            fi
+            pkill -f "$HOME/playit" 2>/dev/null || true
+            SECRET_KEY="$PLAYIT_SECRET" nohup $HOME/playit --secret "$PLAYIT_SECRET" > /tmp/playit.log 2>&1 &
+            sleep 3
+            pgrep -f "$HOME/playit" > /dev/null
+          }
+
+          start_hysteria2() {
+            HY2_ON=""; HY2_PIN=""
+            if [ -z "$PLAYIT_SECRET" ]; then
+              echo "ℹ️ Hysteria2 skipped: add the repo Secret PLAYIT_SECRET (see README, 3 minutes, free)."
+              return 0
+            fi
+            if [ ! -x $HOME/hy2/hysteria ]; then echo "⚠️ hysteria binary missing."; return 0; fi
+            if [ ! -f /tmp/xray_server/hy2.crt ]; then
+              openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+                -keyout /tmp/xray_server/hy2.key -out /tmp/xray_server/hy2.crt \
+                -days 3650 -subj "/CN=www.bing.com" > /dev/null 2>&1
+            fi
+            HY2_PIN=$(openssl x509 -in /tmp/xray_server/hy2.crt -noout -fingerprint -sha256 | cut -d= -f2)
+            pkill -f "hysteria server" 2>/dev/null || true
+            nohup $HOME/hy2/hysteria server -c /tmp/xray_server/hysteria.yaml > /tmp/hysteria.log 2>&1 &
+            sleep 2
+            if ! pgrep -f "hysteria server" > /dev/null; then
+              echo "⚠️ hysteria failed to start:"; tail -n 20 /tmp/hysteria.log || true
+              HY2_PIN=""; return 0
+            fi
+            echo "✅ hysteria server listening on UDP 8444"
+            if ! start_playit; then
+              echo "⚠️ playit agent could not start; Hysteria2 disabled."
+              pkill -f "hysteria server" 2>/dev/null || true
+              HY2_PIN=""; return 0
+            fi
+            if [ -z "$HY2_ENDPOINT" ]; then
+              local i ep
+              for i in $(seq 1 12); do
+                ep=$(discover_playit_endpoint 2>/tmp/playit_disc.txt) && { HY2_ENDPOINT="$ep"; break; }
+                sleep 4
+              done
+              [ -n "$HY2_ENDPOINT" ] && echo "✅ playit assigned $HY2_ENDPOINT" || { cat /tmp/playit_disc.txt | tail -n 2; }
+            fi
+            if [ -z "$HY2_ENDPOINT" ]; then
+              echo "⚠️ No public UDP endpoint. In playit.gg create a UDP tunnel -> 127.0.0.1:8444, or set the repo Variable HY2_ENDPOINT (host:port)."
+              pkill -f "hysteria server" 2>/dev/null || true
+              docker rm -f playit > /dev/null 2>&1 || true
+              HY2_PIN=""; return 0
+            fi
+            HY2_ON=1
+            echo "✅ Hysteria2 live at ${HY2_ENDPOINT} (UDP via playit.gg)"
+          }
+
+          # Live self-test through the public tunnel. Anything that fails is left out of the
+          # subscription this cycle (and shown as Off on the site) instead of being a dead config.
+          probe_all() {
+            DISABLED=""
+            local key path net code ok i
+            while read -r key path net; do
+              ok=""
+              for i in 1 2 3; do
+                if [ "$net" = "xhttp" ]; then
+                  code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 8 "https://${DOMAIN}${path}" || true)
+                  case "$code" in 000|403|5*) ;; *) ok=1 ;; esac
+                else
+                  code=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 6 \
+                    -H "Connection: Upgrade" -H "Upgrade: websocket" \
+                    -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+                    "https://${DOMAIN}${path}" 2>/dev/null || true)
+                  [ "$code" = "101" ] && ok=1
+                fi
+                [ -n "$ok" ] && break
+                sleep 2
+              done
+              if [ -n "$ok" ]; then echo "  ✅ ${key} (${net}) HTTP ${code}"
+              else
+                local lcode
+                lcode=$(curl -s -o /dev/null -w '%{http_code}' --http1.1 --max-time 5 \
+                  -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" \
+                  -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" "http://127.0.0.1:8080${path}" 2>/dev/null || true)
+                echo "  ❌ ${key} (${net}) public HTTP ${code:-000}, local nginx->xray HTTP ${lcode:-000}: excluded this cycle"
+                [ "$lcode" = "101" ] || [ "$net" = "xhttp" ] && echo "     (server side answers locally, so the Cloudflare edge/tunnel is rejecting this transport)" || echo "     (server side itself rejects it; xray log tail follows)"
+                tail -n 3 /tmp/xray.log 2>/dev/null | sed 's/^/     xray: /' || true
+                DISABLED="${DISABLED:+$DISABLED,}${key}"
+              fi
+            done < <(python3 server/generate_configs.py --probe-list)
+
+            if [ -n "$RL_PORT" ]; then
+              if echo | timeout 10 openssl s_client -connect "${RL_HOST}:${RL_PORT}" -servername www.microsoft.com 2>/dev/null | grep -q "subject="; then
+                echo "  ✅ vless-reality (tcp via ${RL_HOST}:${RL_PORT})"
+              else
+                echo "  ❌ vless-reality did not answer through bore.pub: excluded this cycle"
+                DISABLED="${DISABLED:+$DISABLED,}vless-reality"
+              fi
+            fi
+          }
+
+          publish() {
+            probe_all
+            rm -rf dist && mkdir -p dist
+            cp -r web/. dist/
+            python3 server/generate_configs.py --action client \
+              --domain "$DOMAIN" --repo "$REPO" \
+              --output-dir dist --server-dir /tmp/xray_server \
+              --mtproto-host "$MTP_HOST" --mtproto-port "$MTP_PORT" \
+              --reality-host "$RL_HOST" --reality-port "$RL_PORT" --disabled "$DISABLED" \
+              --hy2-endpoint "${HY2_ON:+$HY2_ENDPOINT}" --hy2-pin "$HY2_PIN"
+
+            rm -rf /tmp/gh_deploy && mkdir -p /tmp/gh_deploy
+            cp -r dist/. /tmp/gh_deploy/
+            (
+              cd /tmp/gh_deploy
+              git init -q -b gh-pages
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              B64_AUTH=$(printf "x-access-token:%s" "$TOKEN" | base64 -w 0)
+              git config "http.https://github.com/.extraheader" "AUTHORIZATION: basic ${B64_AUTH}"
+              git remote add origin "https://github.com/${REPO}.git"
+              git add -A
+              git commit -q -m "Deploy subscription (${DOMAIN})" || true
+              git push -q -f origin gh-pages
+            ) || { echo "⚠️ Push to gh-pages failed; check PAT_TOKEN permissions."; return 0; }
+
+            local code
+            code=$(curl -s -w "%{http_code}" -o /tmp/pages_dispatch.txt -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${REPO}/actions/workflows/pages.yml/dispatches" \
+              -d "{\"ref\":\"${BRANCH}\"}")
+            if [ "$code" = "204" ]; then
+              echo "✅ gh-pages updated and Pages deploy queued."
+            else
+              echo "⚠️ Pages dispatch returned HTTP $code:"; cat /tmp/pages_dispatch.txt || true
+            fi
+          }
+
+          echo "=== 1. Server configs ==="
+          python3 server/generate_configs.py --action server --server-dir /tmp/xray_server \
+            --xray-bin $HOME/xray/xray
+
+          echo "=== 2. Local services ==="
+          nohup python3 server/backend.py --port 8081 \
+            --configs-json /tmp/xray_server/configs.json \
+            --sub-file /tmp/gh_deploy/sub.txt \
+            --xray-bin $HOME/xray/xray \
+            --max-duration 20700 > /tmp/backend.log 2>&1 &
+          sleep 1
+          pgrep -f "server/backend.py" > /dev/null || { cat /tmp/backend.log; exit 1; }
+          echo "✅ Backend on 127.0.0.1:8081"
+
+          nohup $HOME/xray/xray run -c /tmp/xray_server/xray_config.json > /tmp/xray.log 2>&1 &
+          sleep 2
+          pgrep -f "$HOME/xray/xray run" > /dev/null || { cat /tmp/xray.log; exit 1; }
+          echo "✅ Xray (VLESS WS/HTTPUpgrade/XHTTP, VMess WS/HTTPUpgrade, Trojan, Shadowsocks + Stats API)"
+
+          sudo nginx -c /tmp/xray_server/nginx.conf
+          sleep 1
+          pgrep -x nginx > /dev/null || { cat /tmp/nginx_error.log || true; exit 1; }
+          echo "✅ Nginx on 127.0.0.1:8080"
+
+          echo "=== 3. Cloudflare quick tunnel ==="
+          nohup $HOME/cf/cloudflared tunnel --no-autoupdate \
+            --url http://127.0.0.1:8080 --logfile /tmp/argo.log > /dev/null 2>&1 &
+          URL=""
+          for i in $(seq 1 45); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/argo.log 2>/dev/null | head -n 1 || true)
+            [ -n "$URL" ] && break
+            sleep 1
+          done
+          [ -n "$URL" ] || { echo "❌ No trycloudflare URL"; cat /tmp/argo.log; exit 1; }
+          DOMAIN=${URL#https://}
+          echo "✅ Tunnel: $DOMAIN"
+
+          for i in $(seq 1 30); do
+            curl -fsS --max-time 3 "https://${DOMAIN}/ping" > /dev/null 2>&1 && { echo "✅ Tunnel reachable"; break; }
+            sleep 2
+          done
+
+          echo "=== 4. Telegram MTProto (TCP via bore.pub) ==="
+          start_mtproto
+
+          echo "=== 4a. VLESS REALITY (TCP via bore.pub, experimental) ==="
+          start_reality
+
+          echo "=== 4b. Hysteria2 (UDP via playit.gg, optional) ==="
+          start_hysteria2
+
+          echo "=== 5. Publish ==="
+          publish
+          echo "🌐 Dashboard: ${GH_PAGES_URL}"
+          echo "🔗 Sub:       ${GH_PAGES_URL}sub.txt"
+          [ -n "$MTP_PORT" ] && echo "✈️ MTProto:   ${GH_PAGES_URL}mtproto.txt"
+
+          echo "=== 6. Keepalive loop ==="
+          TARGET_RUNTIME=20700
+          START_TIME=$(date +%s)
+          while true; do
+            ELAPSED=$(( $(date +%s) - START_TIME ))
+
+            if ! pgrep -f "$HOME/cf/cloudflared" > /dev/null; then
+              echo "⚠️ cloudflared died; ending session so a fresh one starts."
+              tail -n 20 /tmp/argo.log || true
+              break
+            fi
+            pgrep -x nginx > /dev/null || sudo nginx -c /tmp/xray_server/nginx.conf || true
+            if ! pgrep -f "$HOME/xray/xray run" > /dev/null; then
+              nohup $HOME/xray/xray run -c /tmp/xray_server/xray_config.json > /tmp/xray.log 2>&1 &
+            fi
+            if [ -n "$HY2_ON" ] && command -v docker > /dev/null && ! docker ps --format '{{.Names}}' | grep -qx playit && ! pgrep -f "$HOME/playit" > /dev/null; then
+              echo "⚠️ playit agent stopped; restarting it."; start_playit || true
+            fi
+            if [ -n "$HY2_ON" ] && ! pgrep -f "hysteria server" > /dev/null; then
+              nohup $HOME/hy2/hysteria server -c /tmp/xray_server/hysteria.yaml > /tmp/hysteria.log 2>&1 &
+            fi
+            if [ -n "$RL_PORT" ] && ! pgrep -f "bore local 10010" > /dev/null; then
+              echo "⚠️ REALITY tunnel dropped; reconnecting and republishing..."
+              start_reality
+              publish
+            fi
+            if [ -n "$MTP_PORT" ] && { ! pgrep -f "bore local 8443" > /dev/null || ! pgrep -f "$HOME/mtg/mtg" > /dev/null; }; then
+              echo "⚠️ MTProto tunnel dropped; reconnecting and republishing..."
+              start_mtproto
+              publish
+            fi
+
+            if [ $ELAPSED -ge $TARGET_RUNTIME ]; then
+              echo "⏰ ~5h45m reached; dispatching next session."
+              if [ -n "$PAT_TOKEN" ]; then
+                curl -s -o /dev/null -w "Dispatch HTTP %{http_code}\n" -X POST \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "Authorization: Bearer ${PAT_TOKEN}" \
+                  "https://api.github.com/repos/${REPO}/actions/workflows/main.yml/dispatches" \
+                  -d "{\"ref\":\"${BRANCH}\"}"
+              else
+                echo "ℹ️ No PAT_TOKEN; auto.yml watchdog will restart the server."
+              fi
+              sleep 60
+              break
+            fi
+            sleep 60
+          done
